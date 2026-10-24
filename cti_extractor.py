@@ -26,7 +26,7 @@ import math
 import re
 import sqlite3
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -1316,6 +1316,46 @@ def looks_like_structural_scalar_artifact(value: Any) -> bool:
         return False
     return all(word in STRUCTURAL_SCALAR_WORDS for word in words)
 
+def infer_count_table_layout(
+    matrix: Sequence[Sequence[str]],
+    context: HeaderContext | None = None,
+) -> dict[str, Any] | None:
+    """Lit les blocs Nombre/Réponses par leurs séparateurs, jamais par leurs valeurs.
+
+    Les limites d'un en-tête externe simple ne sont pas celles des blocs
+    locaux H/F/Total. Les voies et sous-groupes vides conservent leur place.
+    """
+    for r, row in enumerate(matrix):
+        markers = []
+        for c, value in enumerate(row):
+            marker = re.sub(r"[\s.]", "", clean_text(value).casefold())
+            if marker in {"nb", "nbrép", "nbrep", "nombre", "nbréponses", "nbreponses"}:
+                markers.append((c, "Nombre de réponses" if "rep" in marker or "rép" in marker else "Nombre"))
+        if r == 0 or len(markers) < 2 or not any(role == "Nombre de réponses" for _, role in markers):
+            continue
+        if context and len(context.spans) != len(markers):
+            continue
+        paths = {}
+        for index, (start, role) in enumerate(markers):
+            end = markers[index + 1][0] if index + 1 < len(markers) else len(row)
+            prefix = list(context.spans[index].headers) if context else [role]
+            if context and prefix[-1].casefold() != role.casefold():
+                break
+            for c in range(start + 1, end):
+                headers = dedupe_parts(clean_text(matrix[h][c]) for h in range(r) if c < len(matrix[h]))
+                subgroup = headers[-1] if headers else ""
+                if subgroup.casefold() not in {"h", "f", "hommes", "femmes", "total"}:
+                    break
+                paths[c] = [*prefix, subgroup]
+            else:
+                continue
+            break
+        else:
+            if paths:
+                return {"paths": paths, "data_rows": list(range(r, len(matrix)))}
+    return None
+
+
 def parse_table_records(
     source: Path,
     page_no: int,
@@ -1342,7 +1382,8 @@ def parse_table_records(
     if salary_records is not None:
         return salary_records
 
-    drows = data_rows(matrix)
+    count_layout = infer_count_table_layout(matrix, external_context) if external_context else None
+    drows = count_layout["data_rows"] if count_layout else data_rows(matrix)
     if not drows:
         schema_records = parse_empty_structured_table_schema(
             source=source,
@@ -1366,7 +1407,8 @@ def parse_table_records(
             if looks_like_value(cell):
                 starts.append(c)
                 break
-    data_start = min(starts) if starts else 1
+    data_start = (min(count_layout["paths"]) if count_layout else
+                  min(starts) if starts else 1)
     header_rows = list(range(first_data))
     paths = filled_header_paths(matrix, header_rows, data_start)
 
@@ -1403,7 +1445,7 @@ def parse_table_records(
     # Les séquences de cellules numériques sont appariées, dans l'ordre, aux
     # chemins de l'en-tête externe (FISE/Nombre, FISE/Réponses, etc.).
     run_external_headers: dict[int, list[str]] = {}
-    if external_context and drows:
+    if external_context and drows and not count_layout:
         probe = list(matrix[drows[0]]) + [""] * (ncols - len(matrix[drows[0]]))
         runs: list[list[int]] = []
         current: list[int] = []
@@ -1457,18 +1499,22 @@ def parse_table_records(
 
         row_base = record_base(source, page_no, lines, anchor.center if anchor else table.bbox[1], current_code, current_title)
 
-        for c in range(data_start, ncols):
+        row_records = []
+        for c in (count_layout["paths"] if count_layout else range(data_start, ncols)):
             raw_value = clean_text(row[c])
-            if not raw_value and not include_empty:
+            if not raw_value and not include_empty and not count_layout:
                 continue
             if raw_value and not looks_like_value(raw_value) and not include_empty:
                 continue
             token = numeric_token(raw_value)
             value = token if token is not None else raw_value
 
-            header_parts = dedupe_parts(paths[c] if c < len(paths) else [])
+            header_parts = (count_layout["paths"][c] if count_layout
+                            else dedupe_parts(paths[c] if c < len(paths) else []))
             # Ajoute les en-têtes externes (FISE / nombre de réponses, etc.).
-            if c in run_external_headers:
+            if count_layout:
+                pass
+            elif c in run_external_headers:
                 header_parts = dedupe_parts([*run_external_headers[c], *header_parts])
             elif c < len(intervals) and external_context:
                 x0, x1 = intervals[c]
@@ -1496,11 +1542,42 @@ def parse_table_records(
                 value_text=value,
                 value_num=parse_number(value),
                 value_type=value_type(value),
-                extraction_method="pdfplumber_table",
-                confidence=0.96 if value else 0.78,
-                raw_context=json.dumps({"table_bbox": table.bbox, "row": r, "column": c}, ensure_ascii=False),
+                extraction_method=("pdfplumber_count_blocks" if count_layout else "pdfplumber_table"),
+                confidence=(0.90 if not value else
+                            0.82 if external_context and not count_layout and c not in run_external_headers
+                            else 0.96),
+                raw_context=json.dumps({"table_bbox": table.bbox, "row": r, "column": c,
+                                        "schema_only": not bool(raw_value),
+                                        "schema_numeric_expected": bool(count_layout)}, ensure_ascii=False),
             )
             records.append(rec)
+            row_records.append(rec)
+
+        if count_layout:
+            response_groups: dict[str, dict[str, Record]] = defaultdict(dict)
+            for rec in row_records:
+                if "Nombre de réponses" in rec.column_group:
+                    response_groups[rec.column_group][rec.column_name.casefold()] = rec
+            for index, (group, components) in enumerate(response_groups.items()):
+                if "total" in components:
+                    continue
+                h = components.get("h") or components.get("hommes")
+                f = components.get("f") or components.get("femmes")
+                if h is None or f is None:
+                    continue
+                total = h.value_num + f.value_num if h.value_num is not None and f.value_num is not None else None
+                context = parse_raw_context(h.raw_context)
+                context.update(column=ncols + index, schema_only=total is None,
+                               correction="total_repondants_calcule_h_plus_f",
+                               derived_from_columns=[parse_raw_context(v.raw_context)["column"] for v in (h, f)])
+                records.append(replace(
+                    h, column_name="Total", column_path=group + " > Total",
+                    column_headers_json=json.dumps([*group.split(" > "), "Total"], ensure_ascii=False),
+                    value_num=total, value_text="" if total is None else str(total),
+                    value_type="blank" if total is None else "number",
+                    extraction_method="pdfplumber_count_derived_total",
+                    raw_context=json.dumps(context, ensure_ascii=False),
+                ))
     return records
 
 
@@ -1869,7 +1946,8 @@ def extract_pdf(source: Path, include_empty: bool = False) -> list[Record]:
                 empty_structured_candidate = (
                     not drows
                     and not salary_candidate
-                    and is_empty_structured_table_candidate(matrix)
+                    and (is_empty_structured_table_candidate(matrix)
+                         or infer_count_table_layout(matrix) is not None)
                 )
                 infos.append({
                     "table": table,
@@ -2182,6 +2260,10 @@ def detect_document_info(path: Path, document_id: int) -> DocumentInfo:
         page_count = 0
         first_text = ""
 
+    campaign = re.search(r"\bcampagne\s*[:\-]?\s*(20\d{2})\b", first_text, re.I)
+    if campaign:
+        year = int(campaign.group(1))
+
     school_name = city
     match = re.search(
         r"Par la direction de\s*:\s*(.*?)\s+Académie\s*:",
@@ -2299,6 +2381,14 @@ def field_label(cell: SectionCell, dominant_title: str) -> str:
     label = clean_text(cell.record.column_path) or clean_text(cell.record.column_name)
     if fold_text(label) in GENERIC_VALUE_LABELS:
         label = dominant_title or "valeur"
+    context = clean_text(cell.record.section_title) or dominant_title
+    # Des formulaires réutilisent l'en-tête « Nombre » pour une mesure dont
+    # la nature est définie par la rubrique (notamment les salaires).
+    kind = infer_field_semantics(label, context)[1]
+    if "salaire" in fold_text(context) and "median" in fold_text(context):
+        parts = [clean_text(part) for part in label.split(" > ")]
+        if len(parts) == 2 and kind in {"median_salary", "response_count"}:
+            label = " > ".join([parts[0], "Nombre de réponses" if kind == "response_count" else "Salaire médian", "Total"])
     return label
 
 
@@ -2354,22 +2444,50 @@ def unique_column_name(base: str, used: set[str], identity: str) -> str:
     return final
 
 
-def infer_field_semantics(label: str) -> tuple[str, str, str, str]:
+def infer_field_semantics(
+    label: str, context: str = "", raw_values: Sequence[str] = (),
+) -> tuple[str, str, str, str]:
     folded = fold_text(label)
 
-    if "salaire" in folded and "median" in folded:
+    # L'unité des cellules sources prime sur un libellé générique (Hommes,
+    # Femmes, Valeur...). Ne jamais inférer un pourcentage de sa seule valeur.
+    numeric_values = [clean_text(value) for value in raw_values
+                      if parse_number(value) is not None]
+    percent_values = [value for value in numeric_values
+                      if re.fullmatch(r"[-+]?\d+(?:[ .]\d{3})*(?:[,.]\d+)?\s*%", value)]
+    if percent_values:
+        if len(percent_values) != len(numeric_values):
+            return (
+                "", "mixed_units", "not_aggregatable",
+                "Unités sources hétérogènes : pourcentages et nombres sans unité "
+                "explicite. Ne pas agréger sans résoudre cette ambiguïté.",
+            )
+        return (
+            "percent", "percentage", "weighted_average_if_counts_available",
+            "Pourcentage attesté par le symbole % dans les cellules sources, "
+            "exprimé sur 100. Non additionnable entre populations. Recalculer "
+            "sur les effectifs ou pondérer par les dénominateurs correspondants ; "
+            "sans ces effectifs, aucune proportion globale n'est calculable.",
+        )
+
+    # Le rôle de dénominateur prime sur le sujet de la rubrique : des
+    # répondants à une question de salaire ne sont pas des montants en EUR.
+    if ("nombre de reponses" in folded or "nb rep" in folded
+            or re.search(r"\b(nombre|nb)\b.*\b(repondants?|repondu)\b", folded)):
+        return (
+            "count", "response_count", "sum",
+            "Nombre de répondants associé à la mesure.",
+        )
+    measure_context = folded + " " + fold_text(context)
+    if "salaire" in measure_context and "median" in measure_context:
         return (
             "EUR",
             "median_salary",
-            "do_not_average_medians",
-            "Salaire médian annuel extrait du tableau CTI.",
-        )
-    if "nombre de reponses" in folded or "nb rep" in folded:
-        return (
-            "count",
-            "response_count",
-            "sum",
-            "Nombre de répondants associé à la mesure.",
+            "weighted_average_by_response_count",
+            "Salaire médian annuel extrait du tableau CTI. Pour une synthèse, "
+            "pondérer par le nombre de réponses de la même voie, du même "
+            "sous-groupe et de la même catégorie de primes. Le résultat est "
+            "une moyenne pondérée des médianes, pas une médiane globale.",
         )
     if "pourcentage" in folded or "taux" in folded or "%" in label:
         return (
@@ -2379,6 +2497,13 @@ def infer_field_semantics(label: str) -> tuple[str, str, str, str]:
             "Pourcentage déclaré dans le formulaire.",
         )
     if "nombre" in folded or "effectif" in folded or "total" in folded:
+        if re.search(r"\ba\s+\d+(?:\s*[-–]\s*\d+)?\s+mois\b", folded):
+            return (
+                "count", "count", "sum_within_horizon",
+                "Effectif sommable uniquement à horizon d'observation identique. "
+                "Les colonnes de périodes différentes décrivent des observations "
+                "distinctes et ne sont pas des populations parallèles à additionner.",
+            )
         return (
             "count",
             "count",
@@ -2417,7 +2542,9 @@ def build_section_field_specs(
         original_labels = sorted(labels[(base, occurrence)])
         name_base = base if occurrence == 1 else f"{base}_{occurrence}"
         unit, kind, aggregation, description = infer_field_semantics(
-            " | ".join(original_labels)
+            " | ".join(original_labels),
+            " | ".join(sorted({cell.record.section_title for cell in cells if cell.record.section_title})),
+            [cell.record.value_text for cell in numeric],
         )
         binding = SectionFieldBinding()
 
@@ -2971,10 +3098,18 @@ def extract_cti_to_sections(
     records_by_document: dict[int, list[Record]] = {}
     all_records: list[Record] = []
 
-    for document_id, pdf_path in enumerate(pdfs, start=1):
+    seen_contents: set[tuple[str, int | None, str]] = set()
+    for pdf_path in pdfs:
+        document_id = len(documents) + 1
+        document = detect_document_info(pdf_path, document_id)
+        identity = (document.school_key, document.year, hashlib.sha256(pdf_path.read_bytes()).hexdigest())
+        if identity in seen_contents:
+            if verbose:
+                print(f"Doublon de contenu ignoré : {pdf_path}", file=sys.stderr)
+            continue
+        seen_contents.add(identity)
         if verbose:
             print(f"Extraction CTI : {pdf_path}", file=sys.stderr)
-        document = detect_document_info(pdf_path, document_id)
         records = extract_pdf(pdf_path, include_empty=include_empty)
         documents.append(document)
         records_by_document[document_id] = records

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import sqlite3
@@ -323,6 +324,12 @@ def header_paths(matrix: Sequence[Sequence[str]], header_rows: Sequence[int], da
         for c in range(data_start, ncols):
             cell = clean_text(row[c])
             if cell:
+                # Dans DEFI, Total est une cellule sœur du bloc H/F plutôt
+                # qu'un enfant fusionné de son en-tête de période.
+                if (cell.casefold() == "total" and current
+                        and re.search(r"\b(mois|promotion|ann[eé]e)\b", current, re.I)):
+                    if current.casefold() not in {p.casefold() for p in paths[c]}:
+                        paths[c].append(current)
                 current = cell
                 filled[c] = cell
             elif c > data_start and previous_paths[c] == previous_paths[c - 1]:
@@ -982,11 +989,35 @@ def parse_generic_table(
             continue
 
         row_name = clean_text(row[0]) if data_start > 0 else ""
+        merged_targets = set()
         for c in range(data_start, ncols):
+            if c in merged_targets:
+                continue
             value = clean_text(row[c])
             if not value and not include_empty:
                 continue
-            hp = dedupe_parts(paths[c] if c < len(paths) else [])
+            semantic_column = c
+            cell = table.rows[r].cells[c]
+            if value and cell:
+                # Une valeur fusionnée sur tout un bloc H/F/Total est le
+                # total du bloc, pas la valeur du premier sous-groupe H.
+                targets = []
+                for target in range(c + 1, ncols):
+                    if (not paths[target] or paths[target][-1].casefold() != "total"
+                            or clean_text(row[target]) or table.rows[r].cells[target] is not None):
+                        continue
+                    if paths[target][:-1] and paths[target][:-1] != paths[c][:-1]:
+                        continue
+                    for header_row in column_header_rows:
+                        header_cell = table.rows[header_row].cells[target]
+                        if (header_cell and cell[0] <= header_cell[0] + 0.5
+                                and header_cell[2] <= cell[2] + 0.5):
+                            targets.append(target)
+                            break
+                if len(targets) == 1:
+                    semantic_column = targets[0]
+                    merged_targets.add(semantic_column)
+            hp = dedupe_parts(paths[semantic_column] if semantic_column < len(paths) else [])
             if not hp:
                 if data_start == 1 and ncols == 2:
                     hp = ["Valeur"]
@@ -1002,7 +1033,8 @@ def parse_generic_table(
                 value=value,
                 method="pdfplumber_defi_table",
                 confidence=confidence if value else 0.76,
-                raw_context={"table_bbox": list(map(float, table.bbox)), "row": r, "column": c},
+                raw_context={"table_bbox": list(map(float, table.bbox)), "row": r, "column": c,
+                             "semantic_column": semantic_column},
             ))
     return records
 
@@ -1391,7 +1423,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Aucun PDF trouvé.", file=sys.stderr)
         return 2
     all_records: list[Record] = []
+    seen_contents: set[tuple[str, int | None, str]] = set()
     for source in pdfs:
+        school = re.split(r"[-_ ]defi[-_ ]", source.stem, flags=re.I)[0].casefold()
+        with pdfplumber.open(source) as pdf:
+            first_text = " ".join(page.extract_text() or "" for page in pdf.pages[:2])
+        campaign = re.search(r"\bcampagne\s*[:\-]?\s*(20\d{2})\b", first_text, re.I)
+        filename_years = re.findall(r"(?<!\d)(20\d{2})(?!\d)", source.stem)
+        year = int(campaign.group(1)) if campaign else int(filename_years[-1]) if filename_years else None
+        identity = (school, year, hashlib.sha256(source.read_bytes()).hexdigest())
+        if identity in seen_contents:
+            print(f"Doublon de contenu ignoré : {source}")
+            continue
+        seen_contents.add(identity)
         print(f"Extraction : {source}")
         recs = extract_pdf(source, include_empty=args.include_empty)
         print(f"  {len(recs)} enregistrements")

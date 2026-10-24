@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -232,11 +233,14 @@ def generate_semantic_schema(
                 column["original_labels_json"]
             )
 
-            label = (
-                " > ".join(labels)
-                if labels
-                else column["column_name"]
-            )
+            # Chaque entrée est déjà un chemin complet, pas un étage de la
+            # hiérarchie. Les variantes annuelles ne doivent pas être concaténées.
+            canonical_labels = list(dict.fromkeys(
+                re.sub(r"\b20\d{2}\b", "année", re.sub(
+                    r"\b20\d{2}\s*[-–/]\s*20\d{2}\b", "année", label
+                )) for label in labels
+            ))
+            label = canonical_labels[0] if canonical_labels else column["column_name"]
 
             block.append(
                 f"- {column['column_name']} "
@@ -246,6 +250,8 @@ def generate_semantic_schema(
             block.append(
                 f"  libellé: {label}"
             )
+            if len(canonical_labels) > 1:
+                block.append("  variantes de libellé: " + " | ".join(canonical_labels[1:]))
 
             if column["measure_kind"]:
                 block.append(
@@ -257,10 +263,19 @@ def generate_semantic_schema(
                     f"  unité: {column['unit']}"
                 )
 
-            if column["aggregation_hint"]:
+            aggregation = column["aggregation_hint"]
+            # Les bases déjà extraites portent encore l'ancien contrat.
+            # Mettre à jour le schéma sans réextraire les PDF ni modifier la base.
+            if (
+                column["measure_kind"] == "median_salary"
+                and aggregation == "do_not_average_medians"
+            ):
+                aggregation = "weighted_average_by_response_count"
+
+            if aggregation:
                 block.append(
                     f"  agrégation: "
-                    f"{column['aggregation_hint']}"
+                    f"{aggregation}"
                 )
 
             if column["description"]:

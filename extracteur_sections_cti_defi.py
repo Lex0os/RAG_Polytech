@@ -34,7 +34,7 @@ import re
 import sqlite3
 import sys
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -66,6 +66,7 @@ class SourceDocument:
     source_path: str
     page_count: int
     file_sha256: str
+    source_aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -401,6 +402,14 @@ def create_documents_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "ALTER TABLE documents ADD COLUMN file_sha256 TEXT"
     )
+    connection.execute("""
+        CREATE TABLE document_aliases (
+            document_id INTEGER NOT NULL REFERENCES documents(id),
+            source_file TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            PRIMARY KEY (document_id, source_path)
+        )
+    """)
 
 
 def validate_no_structural_header_artifacts(connection: sqlite3.Connection) -> None:
@@ -561,6 +570,12 @@ def build_unified_section_database(
                 )
                 for document in documents
             ],
+        )
+        connection.executemany(
+            "INSERT INTO document_aliases(document_id, source_file, source_path) VALUES (?, ?, ?)",
+            [(document.id, Path(path).name, path)
+             for document in documents
+             for path in (document.source_path, *document.source_aliases)],
         )
 
         for index, ((source_type, section_code), cells) in enumerate(
@@ -1129,11 +1144,22 @@ def extract_to_sections(
         list[cti_extractor.Record],
     ] = {}
 
-    for document_id, pdf_path in enumerate(pdfs, start=1):
+    seen_contents: dict[tuple[str, str, int | None, str], int] = {}
+    for pdf_path in pdfs:
+        document_id = len(documents) + 1
         metadata = read_document_metadata(
             pdf_path,
             document_id,
         )
+        identity = (metadata.school_key, metadata.source_type, metadata.year, metadata.file_sha256)
+        if identity in seen_contents:
+            index = seen_contents[identity]
+            original = documents[index]
+            documents[index] = dataclass_replace(original, source_aliases=(*original.source_aliases, metadata.source_path))
+            if verbose:
+                print(f"Doublon de contenu ignoré : {pdf_path.name} (conservé : {original.source_file})", file=sys.stderr)
+            continue
+        seen_contents[identity] = len(documents)
 
         if verbose:
             print(
