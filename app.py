@@ -14,6 +14,55 @@ UPLOAD_DIR = PROJECT_DIR / "documents_brut"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def afficher_pdf(nom_pdf, cle):
+    fichier = Path(nom_pdf)
+    if fichier.name != nom_pdf or fichier.suffix.lower() != ".pdf":
+        st.warning("Nom de document invalide.")
+        return
+
+    try:
+        chemin_pdf = (UPLOAD_DIR / fichier).resolve(strict=True)
+        if (
+            chemin_pdf.parent != UPLOAD_DIR.resolve()
+            or chemin_pdf.suffix.lower() != ".pdf"
+        ):
+            st.warning("Emplacement du document invalide.")
+            return
+        contenu_pdf = chemin_pdf.read_bytes()
+    except (OSError, RuntimeError):
+        st.warning(f"Document PDF indisponible : {nom_pdf}")
+        return
+
+    st.pdf(contenu_pdf, height=650, key=f"{cle}_lecteur", alt=nom_pdf)
+    st.download_button(
+        "Télécharger ce PDF",
+        data=contenu_pdf,
+        file_name=nom_pdf,
+        mime="application/pdf",
+        key=f"{cle}_telechargement",
+        on_click="ignore",
+    )
+
+
+def afficher_sources_pdf(sources, cle):
+    with st.expander("Sources PDF de cette réponse"):
+        if not sources:
+            st.info("Aucun document source enregistré pour cette réponse.")
+            return
+
+        for nom_pdf in sources:
+            st.write(nom_pdf)
+
+        document = st.selectbox(
+            "Choisir une source à consulter",
+            [None] + sources,
+            format_func=lambda nom: nom or "Choisir un PDF",
+            key=f"{cle}_selection",
+        )
+        if document is not None:
+            afficher_pdf(document, cle)
+
+
 st.set_page_config(
     page_title="Assistant Polytech",
     page_icon="🤖",
@@ -70,9 +119,14 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 
-for message in st.session_state.messages:
+for index_message, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message["role"] == "assistant":
+            afficher_sources_pdf(
+                message.get("source_files", []),
+                f"message_{index_message}",
+            )
 
 
 # -----------------------
@@ -98,7 +152,12 @@ if question:
             with st.spinner("Recherche et génération de la requête..."):
                 result = engine.ask(question)
 
+            sources = result.get("source_files", [])
             st.markdown(result["answer"])
+            afficher_sources_pdf(
+                sources,
+                f"message_{len(st.session_state.messages)}",
+            )
 
             with st.expander("Détails techniques"):
                 st.write(
@@ -142,6 +201,7 @@ if question:
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": result["answer"],
+                "source_files": sources,
             })
 
         except Exception as e:
@@ -226,3 +286,21 @@ with st.sidebar:
                 st.error(
                     f"Une erreur est survenue pendant le traitement : {e}"
                 )
+
+with st.sidebar:
+    st.header("Consulter les documents")
+    noms_pdf = sorted(
+        fichier.name
+        for fichier in UPLOAD_DIR.iterdir()
+        if fichier.is_file() and fichier.suffix.lower() == ".pdf"
+    )
+    document_libre = st.selectbox(
+        "Tous les PDF disponibles",
+        [None] + noms_pdf,
+        format_func=lambda nom: nom or "Choisir un document",
+        key="document_libre_selection",
+    )
+
+if document_libre is not None:
+    with st.expander(f"Document : {document_libre}", expanded=True):
+        afficher_pdf(document_libre, "document_libre")

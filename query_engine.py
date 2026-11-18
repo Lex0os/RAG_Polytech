@@ -1615,6 +1615,26 @@ def build_sql_context(selected_entries, schemas):
     )
 
 
+PDF_SOURCE_COLUMN = "_source_files_json"
+PDF_SOURCE_INSTRUCTIONS = f"""PROVENANCE PDF :
+Les tables physiques cti_* et defi_* possèdent une colonne source_file.
+Ajoute une colonne technique {PDF_SOURCE_COLUMN} contenant un tableau JSON
+des noms de PDF des observations qui contribuent à chaque ligne de résultat.
+- Pour une observation : json_array(source_file) AS {PDF_SOURCE_COLUMN}.
+- Pour un agrégat : json_group_array(DISTINCT source_file) AS {PDF_SOURCE_COLUMN}.
+- Utilise les noms de fichiers présents dans SQLite.
+- Applique à la provenance les filtres du calcul, notamment l'école, la
+  campagne, la catégorie et la présence de valeurs exploitables.
+- Conserve les sources propres à chaque groupe et aux lignes retenues après
+  ORDER BY et LIMIT.
+- Dans les CTE, UNION et jointures, transporte la provenance des observations
+  contributrices. Pour réunir des tableaux JSON avec json_each, utilise une
+  sous-requête séparée qui ne multiplie pas les lignes du calcul.
+- Préserve les colonnes métier, le grain des déduplications et les calculs.
+- Une table sélectionnée mais inutilisée ne contribue pas à la provenance.
+- Utilise un tableau vide si aucune observation source ne contribue."""
+
+
 def build_sql_prompt(question, selected_entries, schemas, data_profile=''):
     schema_context = build_sql_context(
         selected_entries,
@@ -1940,6 +1960,8 @@ Règles générales:
 - si le schéma ne permet pas un calcul demandé de façon correcte, retourne
   les données les plus directement pertinentes plutôt que d'inventer
   une formule.
+
+{PDF_SOURCE_INSTRUCTIONS}
 """.strip()
 
     return prompt, schema_context
@@ -4901,6 +4923,8 @@ Contraintes:
   les colonnes choisies et la définition de la mesure, sans inventer de données ;
 - n'ajoute aucune restriction absente de la question ;
 - retourne uniquement le SQL.
+
+{PDF_SOURCE_INSTRUCTIONS}
 """.strip()
 
     corrected = llm.chat(
@@ -5236,6 +5260,48 @@ sémantique fournie.
 # Moteur principal
 # ---------------------------------------------------------------------------
 
+def extract_pdf_sources(connection, columns, rows):
+    source_positions = [
+        index for index, name in enumerate(columns)
+        if name.lower() == PDF_SOURCE_COLUMN
+    ]
+    if not source_positions:
+        return columns, rows, []
+
+    data_positions = [
+        index for index in range(len(columns)) if index not in source_positions
+    ]
+    data_columns = [columns[index] for index in data_positions]
+    data_rows = [tuple(row[index] for index in data_positions) for row in rows]
+    if len(source_positions) != 1 or not rows:
+        return data_columns, data_rows, []
+
+    try:
+        known_files = {
+            name for (name,) in connection.execute("SELECT source_file FROM documents")
+        }
+    except sqlite3.OperationalError:
+        # Une ancienne base peut ne pas disposer de l'index des documents.
+        return data_columns, data_rows, []
+
+    source_position = source_positions[0]
+    source_files = {}
+    for row in rows:
+        raw_sources = row[source_position]
+        if not isinstance(raw_sources, str):
+            continue
+        try:
+            sources = json.loads(raw_sources)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(sources, list):
+            for source in sources:
+                if isinstance(source, str) and source in known_files:
+                    source_files[source] = None
+
+    return data_columns, data_rows, list(source_files)
+
+
 class DataQueryEngine:
 
     def __init__(
@@ -5353,6 +5419,7 @@ class DataQueryEngine:
             error = None
             runtime_profile = ""
             previous_result = ""
+            source_files = []
 
             for attempt in range(self.max_attempts):
                 sql = canonicalize_dimension_literals(
@@ -5436,6 +5503,9 @@ class DataQueryEngine:
                             ]
                             if cursor.description
                             else []
+                        )
+                        columns, rows, source_files = extract_pdf_sources(
+                            connection, columns, rows,
                         )
                     except sqlite3.Error as exc:
                         valid = False
@@ -5576,6 +5646,7 @@ class DataQueryEngine:
                 "physical_tables": physical_tables,
                 "candidates": candidates,
                 "coverage_context": coverage_context,
+                "source_files": source_files,
             }
 
         finally:
