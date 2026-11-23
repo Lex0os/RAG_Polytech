@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import sys
+from llm.llama_provider import LlamaProvider
 import streamlit as st
 
 from llm.groq_provider import GroqProvider
@@ -44,11 +45,28 @@ st.caption("Question → LLM → SQLite → Python → LLM")
 #        max_attempts=3,
 #    )
 #Version OpenAI
+#def get_engine():
+#    llm = OpenAIProvider(
+#        api_key=st.secrets["OPENAI_API_KEY"],
+#        model="gpt-5.6-luna",
+#        reasoning_effort="none",
+#    )
+#
+#    return DataQueryEngine(
+#        llm=llm,
+#        db_path=Path("cti_defi_sections.sqlite"),
+#        schema_path=Path("semantic_schema.txt"),
+#        top_k=30,
+#        max_attempts=3,
+#    )
+#Version Llama
 def get_engine():
-    llm = OpenAIProvider(
-        api_key=st.secrets["OPENAI_API_KEY"],
-        model="gpt-5.6-luna",
-        reasoning_effort="none",
+    llm = LlamaProvider(
+        api_key="local",
+        model="local",
+        base_url="http://127.0.0.1:8080/v1",
+        timeout=None,  # Pas de limite d'attente pour les générations locales.
+        enable_thinking=False,  # Le routage ne dispose que de 300 tokens.
     )
 
     return DataQueryEngine(
@@ -58,7 +76,6 @@ def get_engine():
         top_k=30,
         max_attempts=3,
     )
-
 engine = get_engine()
 
 
