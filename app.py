@@ -45,6 +45,14 @@ def afficher_pdf(nom_pdf, cle):
     )
 
 
+def fermer_documents_pdf():
+    for cle in st.session_state:
+        if cle == "document_libre_selection" or (
+            cle.startswith("message_") and cle.endswith("_selection")
+        ):
+            st.session_state[cle] = None
+
+
 def afficher_sources_pdf(sources, cle):
     with st.expander("Sources PDF de cette réponse"):
         if not sources:
@@ -189,6 +197,7 @@ for index_message, message in enumerate(st.session_state.messages):
 question = st.chat_input(
     "Posez une question sur les données...",
     disabled=configuration_error is not None,
+    on_submit=fermer_documents_pdf,
 )
 
 
