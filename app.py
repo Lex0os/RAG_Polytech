@@ -4,6 +4,7 @@ import sys
 import streamlit as st
 
 from llm.groq_provider import GroqProvider
+from llm.llama_provider import LlamaProvider
 from llm.openai_provider import OpenAIProvider
 from query_engine import DataQueryEngine
 
@@ -77,28 +78,24 @@ st.caption("Question → LLM → SQLite → Python → LLM")
 # LLM + moteur
 # -----------------------
 
-@st.cache_resource
-# Version Groq
-#def get_engine():
-#    llm = GroqProvider(
-#        api_key=st.secrets["GROQ_API_KEY"],
-#        model="openai/gpt-oss-20b",
-#    )
-#
-#    return DataQueryEngine(
-#        llm=llm,
-#       db_path=Path("cti_defi_sections.sqlite"),
-#       schema_path=Path("semantic_schema.txt"),
-#        top_k=10,
-#        max_attempts=3,
-#    )
-#Version OpenAI
-def get_engine():
-    llm = OpenAIProvider(
-        api_key=st.secrets["OPENAI_API_KEY"],
-        model="gpt-5.6-luna",
-        reasoning_effort="none",
-    )
+@st.cache_resource(scope="session")
+def get_engine(provider, model, api_key, base_url):
+    if provider == "OpenAI":
+        options = {}
+        if model != "gpt-5.6-luna":
+            options = {
+                "reasoning_effort": None,
+                "verbosity": None,
+            }
+        llm = OpenAIProvider(api_key=api_key, model=model, **options)
+    elif provider == "Groq":
+        llm = GroqProvider(api_key=api_key, model=model)
+    else:
+        llm = LlamaProvider(
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+        )
 
     return DataQueryEngine(
         llm=llm,
@@ -108,7 +105,63 @@ def get_engine():
         max_attempts=3,
     )
 
-engine = get_engine()
+with st.sidebar:
+    st.header("Modèle de langage")
+
+    default_models = {
+        "OpenAI": "gpt-5.6-luna",
+        "Groq": "openai/gpt-oss-20b",
+        "Llama": "local",
+    }
+    provider = st.selectbox(
+        "Fournisseur",
+        list(default_models),
+        key="llm_provider",
+    )
+    model = st.text_input(
+        "Modèle",
+        value=default_models[provider],
+        key=f"llm_model_{provider}",
+        help="Identifiant du modèle à utiliser chez ce fournisseur.",
+    ).strip()
+
+    base_url = ""
+    if provider == "Llama":
+        base_url = st.text_input(
+            "Adresse du serveur",
+            value="http://127.0.0.1:8080/v1",
+            key="llm_base_url",
+            help="Adresse du serveur Llama compatible avec l'API OpenAI.",
+        ).strip()
+
+    try:
+        configured_api_key = st.secrets.get(f"{provider.upper()}_API_KEY", "")
+    except FileNotFoundError:
+        configured_api_key = ""
+
+    api_key = st.text_input(
+        "Clé API",
+        type="password",
+        key=f"llm_api_key_{provider}",
+        placeholder="Clé configurée" if configured_api_key else "Saisir une clé",
+        help=(
+            "Laisser vide pour utiliser la clé configurée dans secrets.toml. "
+            "Une clé est facultative pour un serveur Llama local."
+        ),
+    ).strip() or configured_api_key
+    if provider == "Llama" and not api_key:
+        api_key = "local"
+
+    configuration_error = None
+    if not model:
+        configuration_error = "Renseignez le modèle à utiliser."
+    elif not api_key:
+        configuration_error = f"Renseignez une clé API pour {provider}."
+    elif provider == "Llama" and not base_url.startswith(("http://", "https://")):
+        configuration_error = "Renseignez une adresse HTTP ou HTTPS pour le serveur Llama."
+
+    if configuration_error:
+        st.warning(configuration_error)
 
 
 # -----------------------
@@ -134,7 +187,8 @@ for index_message, message in enumerate(st.session_state.messages):
 # -----------------------
 
 question = st.chat_input(
-    "Posez une question sur les données..."
+    "Posez une question sur les données...",
+    disabled=configuration_error is not None,
 )
 
 
@@ -150,6 +204,7 @@ if question:
     with st.chat_message("assistant"):
         try:
             with st.spinner("Recherche et génération de la requête..."):
+                engine = get_engine(provider, model, api_key, base_url)
                 result = engine.ask(question)
 
             sources = result.get("source_files", [])

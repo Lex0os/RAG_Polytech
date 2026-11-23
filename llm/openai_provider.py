@@ -18,16 +18,18 @@ class OpenAIProvider:
         api_key,
         model="gpt-5.6-luna",
         reasoning_effort="none",
+        verbosity="low",
     ):
         self.client = OpenAI(api_key=api_key)
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self.verbosity = verbosity
 
     @staticmethod
-    def _responses_text_config(response_format=None):
-        text_config = {
-            "verbosity": "low",
-        }
+    def _responses_text_config(response_format=None, verbosity="low"):
+        text_config = {}
+        if verbosity is not None:
+            text_config["verbosity"] = verbosity
 
         if response_format is None:
             return text_config
@@ -56,16 +58,19 @@ class OpenAIProvider:
         response_format=None,
         max_completion_tokens=1024,
     ):
-        response = self.client.responses.create(
-            model=self.model,
-            input=messages,
-            max_output_tokens=max_completion_tokens,
-            reasoning={
+        kwargs = {
+            "model": self.model,
+            "input": messages,
+            "max_output_tokens": max_completion_tokens,
+            "text": self._responses_text_config(response_format, self.verbosity),
+            "store": False,
+        }
+        if self.reasoning_effort is not None:
+            kwargs["reasoning"] = {
                 "effort": self.reasoning_effort,
-            },
-            text=self._responses_text_config(response_format),
-            store=False,
-        )
+            }
+
+        response = self.client.responses.create(**kwargs)
 
         return response.output_text or ""
 

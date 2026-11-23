@@ -20,9 +20,11 @@ class GroqProvider:
             "messages": messages,
             "temperature": 0,
             "max_completion_tokens": max_completion_tokens,
-            "include_reasoning": False,
-            "reasoning_effort": "low",
         }
+
+        if self.model.startswith("openai/gpt-oss-"):
+            kwargs["include_reasoning"] = False
+            kwargs["reasoning_effort"] = "low"
 
         if response_format is not None:
             kwargs["response_format"] = response_format
@@ -32,9 +34,12 @@ class GroqProvider:
         return response.choices[0].message.content or ""
 
     def chat_json(self, messages, schema=None, max_completion_tokens=4096):
-        if schema is None:
-            response_format = {"type": "json_object"}
-        else:
+        if schema is not None and self.model in (
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.8-27b",
+            "meta-models/muse-spark-open",
+        ):
             response_format = {
                 "type": "json_schema",
                 "json_schema": {
@@ -43,6 +48,16 @@ class GroqProvider:
                     "schema": schema,
                 },
             }
+        else:
+            response_format = {"type": "json_object"}
+            if schema is not None:
+                messages = messages + [{
+                    "role": "user",
+                    "content": (
+                        "Retourne un objet JSON respectant ce schéma :\n"
+                        + json.dumps(schema, ensure_ascii=False)
+                    ),
+                }]
 
         return json.loads(
             self.chat(
